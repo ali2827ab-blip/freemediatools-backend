@@ -198,7 +198,12 @@ def _get_info(url: str):
     android_data = None
     for client in ("android", "web", "combined"):
         for _attempt in range(2):
-            rc, out, _err = _run_ytdlp(["-J", url], timeout=120, client=client)
+            # -f best: with cookies, YouTube can return a format list that
+            # does not match yt-dlp's default selector
+            # (bv*+ba/b), so plain -J fails with "Requested format is
+            # not available" even though formats exist. -f best relaxes
+            # selection; -J still dumps the FULL format list.
+            rc, out, _err = _run_ytdlp(["-J", "-f", "best", url], timeout=120, client=client)
             if rc == 0 and out.strip():
                 try:
                     data = json.loads(out)
