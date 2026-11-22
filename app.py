@@ -133,15 +133,20 @@ def _friendly_error(url: str) -> JSONResponse:
     )
 
 
-def _run_ytdlp(args, timeout=120, client="android"):
+def _run_ytdlp(args, timeout=120, client="android", use_cookies=True):
     """Run yt-dlp, return (returncode, stdout, stderr).
     client="android" (fast, but YouTube's SABR experiment often leaves
     only progressive itag 18), "web" (full format list, occasionally
     slow / JS-challenge warnings) or "combined" (android,web in one run).
     The last 500 chars of stderr are logged and kept for /api/debug so a
-    blocked datacenter IP can be diagnosed from the live logs."""
+    blocked datacenter IP can be diagnosed from the live logs.
+    use_cookies=False runs without --cookies: with the user's cookies,
+    YouTube sometimes returns ONLY storyboard formats (no playable
+    video/audio at all) for every client, while the same video without
+    cookies returns the full format list — so no-cookies is the fallback
+    when the cookies run yields nothing usable."""
     base = _CLIENTS.get(client, YTDLP_BASE)
-    if COOKIES_PATH is not None and COOKIES_PATH.exists():
+    if use_cookies and COOKIES_PATH is not None and COOKIES_PATH.exists():
         base = base + ["--cookies", str(COOKIES_PATH)]
     try:
         p = subprocess.run(
@@ -194,27 +199,33 @@ def _get_info(url: str):
     Android is fast but SABR often leaves only itag 18; the web
     client returns the full list (720p/1080p separate video+audio)
     when it works. Extraction can fail intermittently — one failure
-    is never treated as broken."""
+    is never treated as broken.
+    Cookies are tried first (they clear the bot check), but if a
+    cookies run returns no usable formats, the same clients are
+    retried WITHOUT cookies — a cookies session can return only
+    storyboard formats while the anonymous session returns the full
+    list (verified 2026-11-22 for the Mangal Rang video)."""
     android_data = None
-    for client in ("android", "web", "combined"):
-        for _attempt in range(2):
-            # -f best: with cookies, YouTube can return a format list that
-            # does not match yt-dlp's default selector
-            # (bv*+ba/b), so plain -J fails with "Requested format is
-            # not available" even though formats exist. -f best relaxes
-            # selection; -J still dumps the FULL format list.
-            rc, out, _err = _run_ytdlp(["-J", "-f", "best", url], timeout=120, client=client)
-            if rc == 0 and out.strip():
-                try:
-                    data = json.loads(out)
-                except Exception:
-                    data = None
-                if data:
-                    if _usable_format_count(data) > 2:
-                        return data
-                    if android_data is None:
-                        android_data = data
-                    break
+    for use_cookies in (True, False):
+        for client in ("android", "web", "combined"):
+            for _attempt in range(2):
+                # -f best: with cookies, YouTube can return a format list that
+                # does not match yt-dlp's default selector
+                # (bv*+ba/b), so plain -J fails with "Requested format is
+                # not available" even though formats exist. -f best relaxes
+                # selection; -J still dumps the FULL format list.
+                rc, out, _err = _run_ytdlp(["-J", "-f", "best", url], timeout=120, client=client, use_cookies=use_cookies)
+                if rc == 0 and out.strip():
+                    try:
+                        data = json.loads(out)
+                    except Exception:
+                        data = None
+                    if data:
+                        if _usable_format_count(data) > 2:
+                            return data
+                        if android_data is None:
+                            android_data = data
+                        break
     return android_data
 
 
@@ -373,17 +384,20 @@ def download(url: str = Query(...), quality: int = Query(720)):
     # Fall back to the other client if the first one fails.
     clients = ["web", "android", "combined"] if quality >= 720 else ["android", "web", "combined"]
     ok = False
-    for client in clients:
-        rc, _out, _err = _run_ytdlp(
-            ["-f", fmt, "--merge-output-format", "mp4",
-             "-o", str(tmp_path), url],
-            timeout=600, client=client,
-        )
-        if rc == 0 and tmp_path.exists() and tmp_path.stat().st_size > 100_000:
-            ok = True
+    for use_cookies in (True, False):
+        if ok:
             break
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+        for client in clients:
+            rc, _out, _err = _run_ytdlp(
+                ["-f", fmt, "--merge-output-format", "mp4",
+                 "-o", str(tmp_path), url],
+                timeout=600, client=client, use_cookies=use_cookies,
+            )
+            if rc == 0 and tmp_path.exists() and tmp_path.stat().st_size > 100_000:
+                ok = True
+                break
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
     if not ok:
         return _friendly_error(url)
     tmp_path.rename(out_path)
@@ -407,17 +421,20 @@ def audio(url: str = Query(...)):
     title = _sanitise(data.get("title") or "audio")
     tmp_path = CACHE_DIR / f"{key}_audio.tmp.mp3"
     ok = False
-    for client in ("android", "web", "combined"):
-        rc, _out, _err = _run_ytdlp(
-            ["-f", "ba/b", "-x", "--audio-format", "mp3",
-             "--audio-quality", "0", "-o", str(tmp_path), url],
-            timeout=600, client=client,
-        )
-        if rc == 0 and tmp_path.exists() and tmp_path.stat().st_size > 10_000:
-            ok = True
+    for use_cookies in (True, False):
+        if ok:
             break
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+        for client in ("android", "web", "combined"):
+            rc, _out, _err = _run_ytdlp(
+                ["-f", "ba/b", "-x", "--audio-format", "mp3",
+                 "--audio-quality", "0", "-o", str(tmp_path), url],
+                timeout=600, client=client, use_cookies=use_cookies,
+            )
+            if rc == 0 and tmp_path.exists() and tmp_path.stat().st_size > 10_000:
+                ok = True
+                break
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
     if not ok:
         return _friendly_error(url)
     tmp_path.rename(out_path)
