@@ -41,6 +41,26 @@ BASE_DIR = Path(__file__).resolve().parent
 CACHE_DIR = BASE_DIR / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
+# YouTube cookies (bot-check bypass). The Render service is blocked by
+# YouTube ("Sign in to confirm you're not a bot") from its datacenter IP.
+# Fix: set the YT_COOKIES env var in Render to the full contents of a
+# Netscape-format cookies.txt exported from the user's own signed-in
+# YouTube session. The file is written at startup to /tmp (never to the
+# repo, never logged), and --cookies is added to every yt-dlp call.
+# Cookies are the user's own session — they expire and can be revoked
+# by signing out / changing the Google password.
+COOKIES_PATH = Path("/tmp/yt-cookies.txt")
+_YT_COOKIES = os.environ.get("YT_COOKIES", "")
+if _YT_COOKIES.strip():
+    try:
+        COOKIES_PATH.write_text(_YT_COOKIES)
+        print("[cookies] YT_COOKIES env var present, wrote cookies file", flush=True)
+    except Exception as e:
+        print(f"[cookies] could not write cookies file: {e}", flush=True)
+        COOKIES_PATH = None
+else:
+    COOKIES_PATH = None
+
 ALLOWED_HOSTS = (
     "youtube.com",
     "youtu.be",
@@ -121,6 +141,8 @@ def _run_ytdlp(args, timeout=120, client="android"):
     The last 500 chars of stderr are logged and kept for /api/debug so a
     blocked datacenter IP can be diagnosed from the live logs."""
     base = _CLIENTS.get(client, YTDLP_BASE)
+    if COOKIES_PATH is not None and COOKIES_PATH.exists():
+        base = base + ["--cookies", str(COOKIES_PATH)]
     try:
         p = subprocess.run(
             base + args,
@@ -372,7 +394,7 @@ def audio(url: str = Query(...)):
     out_path = CACHE_DIR / f"{key}_audio.mp3"
     if out_path.exists() and out_path.stat().st_size > 10_000:
         return FileResponse(out_path, media_type="audio/mpeg",
-                        filename="audio.mp3")
+                            filename="audio.mp3")
 
     data = _get_info(url)
     if not data:
