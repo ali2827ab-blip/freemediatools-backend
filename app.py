@@ -68,6 +68,21 @@ YTDLP_WEB = [
     "--no-warnings",
 ]
 
+# Combined client — Android + web in one run. Verified locally 2026-11-22:
+# returns itag 18 even when the iOS / mweb / web_safari clients return
+# "Only images are available" / timeouts. Used as a third attempt on
+# datacenter IPs (Render) where the single clients can be blocked.
+YTDLP_COMBINED = [
+    "yt-dlp",
+    "--js-runtimes", "node",
+    "--extractor-args", "youtube:player_client=android,web",
+    "--no-playlist",
+    "--no-warnings",
+]
+
+_CLIENTS = {"android": YTDLP_BASE, "web": YTDLP_WEB, "combined": YTDLP_COMBINED}
+LAST_DEBUG = {"yt_dlp_version": None, "attempts": []}
+
 app = FastAPI(title="FreeMediaTools Backend")
 
 app.add_middleware(
@@ -101,16 +116,25 @@ def _friendly_error(url: str) -> JSONResponse:
 def _run_ytdlp(args, timeout=120, client="android"):
     """Run yt-dlp, return (returncode, stdout, stderr).
     client="android" (fast, but YouTube's SABR experiment often leaves
-    only progressive itag 18) or "web" (full format list, occasionally
-    slow / JS-challenge warnings)."""
-    base = YTDLP_BASE if client == "android" else YTDLP_WEB
+    only progressive itag 18), "web" (full format list, occasionally
+    slow / JS-challenge warnings) or "combined" (android,web in one run).
+    The last 500 chars of stderr are logged and kept for /api/debug so a
+    blocked datacenter IP can be diagnosed from the live logs."""
+    base = _CLIENTS.get(client, YTDLP_BASE)
     try:
         p = subprocess.run(
             base + args,
             capture_output=True, text=True, timeout=timeout,
         )
+        err_tail = (p.stderr or "")[-500:]
+        if err_tail.strip():
+            print(f"[yt-dlp {client} rc={p.returncode}] {err_tail}", flush=True)
+        LAST_DEBUG["attempts"] = (LAST_DEBUG["attempts"] + [{
+            "client": client, "rc": p.returncode, "stderr": err_tail,
+        }])[-12:]
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
+        print(f"[yt-dlp {client}] timeout after {timeout}s", flush=True)
         return -1, "", "timeout"
     except FileNotFoundError:
         return -1, "", "yt-dlp not installed"
@@ -150,28 +174,20 @@ def _get_info(url: str):
     when it works. Extraction can fail intermittently — one failure
     is never treated as broken."""
     android_data = None
-    for _attempt in range(2):
-        rc, out, _err = _run_ytdlp(["-J", url], timeout=120, client="android")
-        if rc == 0 and out.strip():
-            try:
-                data = json.loads(out)
-            except Exception:
-                data = None
-            if data:
-                if _usable_format_count(data) > 2:
-                    return data
-                android_data = data
-                break
-    # Web client fallback for the full format list.
-    for _attempt in range(2):
-        rc, out, _err = _run_ytdlp(["-J", url], timeout=180, client="web")
-        if rc == 0 and out.strip():
-            try:
-                data = json.loads(out)
-            except Exception:
-                data = None
-            if data and _usable_format_count(data) > 0:
-                return data
+    for client in ("android", "web", "combined"):
+        for _attempt in range(2):
+            rc, out, _err = _run_ytdlp(["-J", url], timeout=120, client=client)
+            if rc == 0 and out.strip():
+                try:
+                    data = json.loads(out)
+                except Exception:
+                    data = None
+                if data:
+                    if _usable_format_count(data) > 2:
+                        return data
+                    if android_data is None:
+                        android_data = data
+                    break
     return android_data
 
 
@@ -188,6 +204,28 @@ def _cache_key(url: str, suffix: str) -> str:
 @app.get("/")
 def root():
     return {"status": "ok"}
+
+
+@app.get("/api/debug")
+def debug(url: str = Query(...)):
+    """Diagnostics only: yt-dlp version + last extraction attempts (client,
+    return code, stderr tail) for this URL. No video data, no secrets."""
+    if not url.startswith(("http://", "https://")) or not _host_allowed(url):
+        return JSONResponse(status_code=400, content={"error": "Sirf YouTube, Instagram, TikTok ya Facebook ka link paste karein."})
+    try:
+        ver = subprocess.run(["yt-dlp", "--version"], capture_output=True,
+                             text=True, timeout=20).stdout.strip()
+    except Exception:
+        ver = None
+    LAST_DEBUG["yt_dlp_version"] = ver
+    data = _get_info(url)
+    return {
+        "yt_dlp_version": ver,
+        "ok": bool(data),
+        "title": data.get("title") if data else None,
+        "usable_formats": _usable_format_count(data) if data else 0,
+        "attempts": LAST_DEBUG["attempts"],
+    }
 
 
 @app.get("/api/info")
@@ -306,7 +344,7 @@ def download(url: str = Query(...), quality: int = Query(720)):
     # 720p/1080p need the web client's separate video+audio formats;
     # <=360p is served fastest by Android's progressive itag 18.
     # Fall back to the other client if the first one fails.
-    clients = ["web", "android"] if quality >= 720 else ["android", "web"]
+    clients = ["web", "android", "combined"] if quality >= 720 else ["android", "web", "combined"]
     ok = False
     for client in clients:
         rc, _out, _err = _run_ytdlp(
@@ -334,7 +372,7 @@ def audio(url: str = Query(...)):
     out_path = CACHE_DIR / f"{key}_audio.mp3"
     if out_path.exists() and out_path.stat().st_size > 10_000:
         return FileResponse(out_path, media_type="audio/mpeg",
-                            filename="audio.mp3")
+                        filename="audio.mp3")
 
     data = _get_info(url)
     if not data:
@@ -342,7 +380,7 @@ def audio(url: str = Query(...)):
     title = _sanitise(data.get("title") or "audio")
     tmp_path = CACHE_DIR / f"{key}_audio.tmp.mp3"
     ok = False
-    for client in ("android", "web"):
+    for client in ("android", "web", "combined"):
         rc, _out, _err = _run_ytdlp(
             ["-f", "ba/b", "-x", "--audio-format", "mp3",
              "--audio-quality", "0", "-o", str(tmp_path), url],
